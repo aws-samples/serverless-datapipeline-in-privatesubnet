@@ -30,7 +30,7 @@ aws cloudformation deploy --template-file ./cfn-kinesis-lambda-dynamo-privatesub
 
 ## Reference Link
 
-vpce-gateway route table exaplained
+vpce-gateway route table explained
 >
 https://docs.aws.amazon.com/vpc/latest/privatelink/vpce-gateway.html
 
