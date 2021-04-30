@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: lambda used to consume from kinesis, find the ancker message and report
+
+
+Parameters:
+  SourceKinesisStreamArn:
+    Description: Arn of the source stream
+    Type: String
+    Default: arn:aws:kinesis:ap-southeast-2:522303534324:stream/teststream
+
+    
+Resources:
+
+###########################
+#  define VPC with only one private subnet without any internet access
+###########################
+
+  VPC:
+      Type: "AWS::EC2::VPC"
+      Properties:
+        EnableDnsSupport: true
+        EnableDnsHostnames: true        
+        CidrBlock:  "10.1.0.0/16"
+
+  Subneta:
+      Type: "AWS::EC2::Subnet"
+      Properties:
+        AvailabilityZone: !Select
+              - 0
+              - Fn::GetAZs: !Ref "AWS::Region"
+        VpcId: !Ref VPC
+        CidrBlock:   "10.1.1.0/24"
+        MapPublicIpOnLaunch: false
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  SubnetRouteTableAssociationa:
+      Type: "AWS::EC2::SubnetRouteTableAssociation"
+      Properties:
+        SubnetId: !Ref Subneta
+        RouteTableId: !Ref PrivateRouteTable
+        
+###########################
+#  endpoints for Kinesis, Lambda and DynamoDB 
+###########################
+  kinesisEndpoint:
+      Type: "AWS::EC2::VPCEndpoint"
+      Properties:
+        SecurityGroupIds: 
+          - !Ref EndpointSecurityGroup
+        ServiceName: !Sub com.amazonaws.${AWS::Region}.kinesis-streams
+        SubnetIds: 
+          - !Ref Subneta
+        VpcEndpointType: Interface
+        PrivateDnsEnabled: true
+        VpcId: !Ref VPC
+
+  lambdaEndpoint:
+      Type: "AWS::EC2::VPCEndpoint"
+      Properties:
+        SecurityGroupIds: 
+          - !Ref EndpointSecurityGroup
+        ServiceName: !Sub com.amazonaws.${AWS::Region}.lambda
+        SubnetIds: 
+          - !Ref Subneta
+        VpcEndpointType: Interface
+        PrivateDnsEnabled: true
+        VpcId: !Ref VPC        
+        
+  dynamodbEndpoint:
+      Type: "AWS::EC2::VPCEndpoint"
+      #Security Group ID and subnet and privateDNS are only used with interface endpoint
+      Properties:
+        ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+        VpcEndpointType: Gateway
+        VpcId: !Ref VPC      
+        RouteTableIds: 
+          - !Ref PrivateRouteTable
+          
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group 
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 10.1.0.0/16
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 10.1.0.0/16
+      VpcId: !Ref VPC
+
+
+
+  DDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "uuid"
+          AttributeType: "S"
+        -
+          AttributeName: "current_time"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "uuid"
+          KeyType: "HASH"
+        -
+          AttributeName: "current_time"
+          KeyType: "RANGE"
+      BillingMode: PAY_PER_REQUEST
+      TableName: demotable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group 
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        FromPort: -1
+        ToPort: -1
+        CidrIp: 10.1.0.0/16
+      VpcId: !Ref VPC
+  
+  EgressToDynamoDB:
+      Type: AWS::EC2::SecurityGroupEgress
+      Properties: 
+        DestinationPrefixListId: pl-62a5400b
+        FromPort: 443
+        GroupId: !Ref LambdaSecurityGroup
+        IpProtocol: tcp
+        ToPort: 443
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: lambdapolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:*
+            - logs:*
+            - kinesis:*
+            - sns:*
+            - sqs:*
+            - dynamodb:*
+            # access needed to run lambda inside VPC
+            - ec2:DescribeInstances
+            - ec2:CreateNetworkInterface
+            - ec2:AttachNetworkInterface
+            - ec2:DescribeNetworkInterfaces
+            - ec2:DeleteNetworkInterface
+            - autoscaling:CompleteLifecycleAction"
+            Resource: '*'
+
+
+  Lambda:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:580247275435:layer:LambdaInsightsExtension:14"
+      Description:  kinesis consume lambda 
+      Runtime: python3.7
+      Timeout: 180
+      Role: !GetAtt LambdaRole.Arn
+      FunctionName: sam_kinesis_lambda_consumer_privatevpc
+      Handler: lambda-handler.onEventHandler
+      CodeUri: ./lambdas/sam_kinesis_lambda_consumer/
+      VpcConfig:
+         SecurityGroupIds: 
+            - !Ref LambdaSecurityGroup
+         SubnetIds: 
+            - !Ref Subneta
+            
+  LambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: 
+      EventSourceArn: !Ref SourceKinesisStreamArn
+      FunctionName: !Ref Lambda
+      FunctionResponseTypes: 
+        - ReportBatchItemFailures
+      MaximumBatchingWindowInSeconds: 6 
+      MaximumRecordAgeInSeconds: 900 
+      MaximumRetryAttempts: 1 
+      ParallelizationFactor: 1 
+      StartingPosition: LATEST 

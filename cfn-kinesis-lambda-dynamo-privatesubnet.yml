@@ -1,0 +1,298 @@
+#Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: demonstrate how kinesis->lambda->dynamodb pipeline runs inside private subnet without internet access
+
+Parameters:
+
+  # the prefix list varies by region, please check the id from console
+  DynamodbPrefixList:
+    Type: String
+    #dynamodb prefix list in ap-souteast-2
+    Default: "pl-62a5400b"
+
+Resources:
+
+###########################################################
+#  define DynamoDB Table and Kinesis Stream
+###########################################################
+
+  kinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties: 
+      ShardCount: 1
+
+  dynamodbTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "eventID"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "eventID"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+      TableName: demotable
+
+###########################
+#  define VPC with only one private subnet without any internet access
+###########################
+
+  VPC:
+      Type: "AWS::EC2::VPC"
+      Properties:
+        EnableDnsSupport: true
+        EnableDnsHostnames: true        
+        CidrBlock:  "10.1.0.0/16"
+
+  Subneta:
+      Type: "AWS::EC2::Subnet"
+      Properties:
+        AvailabilityZone: !Select
+              - 0
+              - Fn::GetAZs: !Ref "AWS::Region"
+        VpcId: !Ref VPC
+        CidrBlock:   "10.1.1.0/24"
+        MapPublicIpOnLaunch: false
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  SubnetRouteTableAssociationa:
+      Type: "AWS::EC2::SubnetRouteTableAssociation"
+      Properties:
+        SubnetId: !Ref Subneta
+        RouteTableId: !Ref PrivateRouteTable
+
+###########################################################
+#  define endpoints for Kinesis, Lambda and DynamoDB 
+###########################################################
+
+  kinesisEndpoint:
+      Type: "AWS::EC2::VPCEndpoint"
+      Properties:
+        SecurityGroupIds: 
+          - !Ref endpointSecurityGroup
+        ServiceName: !Sub com.amazonaws.${AWS::Region}.kinesis-streams
+        SubnetIds: 
+          - !Ref Subneta
+        VpcEndpointType: Interface
+        PrivateDnsEnabled: true
+        VpcId: !Ref VPC
+        #https://docs.aws.amazon.com/streams/latest/dev/vpc.html
+        #limit endpoint is used to access specified kinesis stream
+        PolicyDocument: 
+          Statement:
+            - Sid: "AccessToSpecificKinesisStream"
+              Effect: Allow
+              Principal: '*'
+              Action:
+                - 'kinesis:*'
+              Resource:
+                - !GetAtt kinesisStream.Arn
+
+  lambdaEndpoint:
+      Type: "AWS::EC2::VPCEndpoint"
+      Properties:
+        SecurityGroupIds: 
+          - !Ref endpointSecurityGroup
+        ServiceName: !Sub com.amazonaws.${AWS::Region}.lambda
+        SubnetIds: 
+          - !Ref Subneta
+        VpcEndpointType: Interface
+        PrivateDnsEnabled: true
+        VpcId: !Ref VPC        
+        
+  dynamodbEndpoint:
+      Type: "AWS::EC2::VPCEndpoint"
+      #Security Group ID and subnet and privateDNS are only used with interface endpoint
+      Properties:
+        ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+        VpcEndpointType: Gateway
+        VpcId: !Ref VPC      
+        RouteTableIds: 
+          - !Ref PrivateRouteTable
+        #https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/vpc-endpoints-dynamodb-tutorial.html
+        #limit endpoint is used to access specified dynamodb table
+        PolicyDocument:
+          Version: 2008-10-17
+          Statement:
+            - Sid: "AccessToSpcifiedDynamoDBTable"
+              Effect: Allow
+              Principal: '*'
+              Action:
+                - 'dynamodb:*'
+              Resource: 
+                - !GetAtt dynamodbTable.Arn
+          
+  endpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group 
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 10.1.0.0/16
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 10.1.0.0/16
+      VpcId: !Ref VPC
+
+###########################################################
+#  define lambda 
+###########################################################
+
+  consumerlambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group 
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 10.1.0.0/16
+      VpcId: !Ref VPC
+  
+  consumerlambdaEgressToDynamoDB:
+      Type: AWS::EC2::SecurityGroupEgress
+      Properties: 
+        DestinationPrefixListId: !Ref DynamodbPrefixList
+        FromPort: 443
+        GroupId: !Ref consumerlambdaSecurityGroup
+        IpProtocol: tcp
+        ToPort: 443
+
+  publisherlambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group 
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 10.1.0.0/16
+      VpcId: !Ref VPC
+
+  lambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: lambdapolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:*
+            - logs:*
+            - kinesis:*
+            - dynamodb:*
+            # access needed to run lambda inside VPC
+            - ec2:DescribeInstances
+            - ec2:CreateNetworkInterface
+            - ec2:AttachNetworkInterface
+            - ec2:DescribeNetworkInterfaces
+            - ec2:DeleteNetworkInterface
+            - autoscaling:CompleteLifecycleAction
+            Resource: '*'
+            
+  LambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: 
+      EventSourceArn: !GetAtt kinesisStream.Arn
+      FunctionName: !Ref kinesisConsumerLambda
+      StartingPosition: LATEST 
+
+  kinesisConsumerLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description:  kinesis consume lambda and put item to dynamodb
+      Runtime: python3.7
+      Role: !GetAtt lambdaRole.Arn
+      FunctionName: cfn_kinesis_lambda_consumer_privatevpc
+      Handler: index.onEventHandler
+      VpcConfig:
+         SecurityGroupIds: 
+            - !Ref consumerlambdaSecurityGroup
+         SubnetIds: 
+            - !Ref Subneta
+      Code:
+        ZipFile: | 
+          import boto3
+          import base64
+
+          dynamodb_table=boto3.resource('dynamodb').Table('demotable')
+          def onEventHandler(event, context):  
+              for record in event['Records']:
+                  dynamodb_table.put_item(
+                      Item={
+                          'eventID':record["eventID"],
+                          'payload': base64.b64decode(record["kinesis"]["data"]).decode('utf-8')
+                      }
+                  )
+ 
+
+  kinesisPublisherLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: lambda triggerred by CRON to put message to KinesisStream
+      Runtime: python3.7
+      Role: !GetAtt lambdaRole.Arn
+      FunctionName: cfn_kinesis_lambda_publisher_privatevpc
+      Handler: index.onEventHandler
+      VpcConfig:
+         SecurityGroupIds: 
+            - !Ref publisherlambdaSecurityGroup
+         SubnetIds: 
+            - !Ref Subneta
+      Environment:
+          Variables:
+            StreamName: !Ref kinesisStream
+      Code:
+        ZipFile: | 
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          kinesis_client = boto3.client('kinesis')
+          streamName=os.environ['StreamName']
+          def onEventHandler(event, context):
+            kinesis_client.put_record(
+                    StreamName=streamName,
+                    Data="message generated at: " + datetime.now().strftime("%d/%m/%Y, %H:%M:%S"),
+                    PartitionKey=str(uuid.uuid1())
+                )
+ 
+
+  ScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: "rate(1 minute)"
+      State: "ENABLED"
+      Targets: 
+        - Id: "kinesispublisherScheduler"
+          Arn: !GetAtt kinesisPublisherLambda.Arn
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref kinesisPublisherLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
