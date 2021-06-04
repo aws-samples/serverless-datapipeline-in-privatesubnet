@@ -13,6 +13,23 @@ Parameters:
 
 Resources:
 
+
+###########################################################
+#  define KMS Key for server-side encryption
+###########################################################
+  kmsKey: 
+    Type: AWS::KMS::Key
+    Properties:      
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: 'kms:*'
+          Resource: '*'
+
+
 ###########################################################
 #  define DynamoDB Table and Kinesis Stream
 ###########################################################
@@ -21,6 +38,9 @@ Resources:
     Type: AWS::Kinesis::Stream
     Properties: 
       ShardCount: 1
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref kmsKey
 
   dynamodbTable:
     Type: AWS::DynamoDB::Table
@@ -69,8 +89,31 @@ Resources:
         RouteTableId: !Ref PrivateRouteTable
 
 ###########################################################
-#  define endpoints for Kinesis, Lambda and DynamoDB 
+#  define endpoints for KMS, Kinesis, Lambda and DynamoDB 
 ###########################################################
+
+  kmsEndpoint:
+      Type: "AWS::EC2::VPCEndpoint"
+      Properties:
+        SecurityGroupIds: 
+          - !Ref endpointSecurityGroup
+        ServiceName: !Sub com.amazonaws.${AWS::Region}.kms
+        SubnetIds: 
+          - !Ref Subneta
+        VpcEndpointType: Interface
+        PrivateDnsEnabled: true
+        VpcId: !Ref VPC
+        #https://docs.aws.amazon.com/streams/latest/dev/vpc.html
+        #limit endpoint is used to access specified key
+        PolicyDocument: 
+          Statement:
+            - Sid: "AccessToSpecificKMSkey"
+              Effect: Allow
+              Principal: '*'
+              Action:
+                - 'kms:*'
+              Resource:
+                - !GetAtt kmsKey.Arn
 
   kinesisEndpoint:
       Type: "AWS::EC2::VPCEndpoint"
@@ -180,7 +223,7 @@ Resources:
         CidrIp: 10.1.0.0/16
       VpcId: !Ref VPC
 
-  lambdaRole:
+  lambdaPublisherRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -198,6 +241,11 @@ Resources:
           Statement:
           - Effect: Allow
             Action:
+            - kms:GenerateDataKey*
+            - kms:DescribeKey
+            - kms:Encrypt
+            - kms:ReEncrypt*
+            - kms:ListGrants
             - cloudwatch:*
             - logs:*
             - kinesis:*
@@ -210,6 +258,40 @@ Resources:
             - ec2:DeleteNetworkInterface
             - autoscaling:CompleteLifecycleAction
             Resource: '*'
+
+  lambdaConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: lambdapolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - kms:Decrypt
+            - kms:DescribeKey
+            - cloudwatch:*
+            - logs:*
+            - kinesis:*
+            - dynamodb:*
+            # access needed to run lambda inside VPC
+            - ec2:DescribeInstances
+            - ec2:CreateNetworkInterface
+            - ec2:AttachNetworkInterface
+            - ec2:DescribeNetworkInterfaces
+            - ec2:DeleteNetworkInterface
+            - autoscaling:CompleteLifecycleAction
+            Resource: '*'
+
             
   LambdaEventSourceMapping:
     Type: AWS::Lambda::EventSourceMapping
@@ -223,13 +305,13 @@ Resources:
     Properties:
       Description:  kinesis consume lambda and put item to dynamodb
       Runtime: python3.7
-      Role: !GetAtt lambdaRole.Arn
+      Role: !GetAtt lambdaConsumerRole.Arn
       FunctionName: cfn_kinesis_lambda_consumer_privatevpc
       Handler: index.onEventHandler
       VpcConfig:
-         SecurityGroupIds: 
+        SecurityGroupIds: 
             - !Ref consumerlambdaSecurityGroup
-         SubnetIds: 
+        SubnetIds: 
             - !Ref Subneta
       Code:
         ZipFile: | 
@@ -239,26 +321,28 @@ Resources:
           dynamodb_table=boto3.resource('dynamodb').Table('demotable')
           def onEventHandler(event, context):  
               for record in event['Records']:
+                  payload=base64.b64decode(record["kinesis"]["data"]).decode('utf-8')
+                  print(payload)
                   dynamodb_table.put_item(
                       Item={
                           'eventID':record["eventID"],
-                          'payload': base64.b64decode(record["kinesis"]["data"]).decode('utf-8')
+                          'payload': payload
                       }
                   )
- 
+
 
   kinesisPublisherLambda:
     Type: 'AWS::Lambda::Function'
     Properties:
       Description: lambda triggerred by CRON to put message to KinesisStream
       Runtime: python3.7
-      Role: !GetAtt lambdaRole.Arn
+      Role: !GetAtt lambdaPublisherRole.Arn
       FunctionName: cfn_kinesis_lambda_publisher_privatevpc
       Handler: index.onEventHandler
       VpcConfig:
-         SecurityGroupIds: 
+        SecurityGroupIds: 
             - !Ref publisherlambdaSecurityGroup
-         SubnetIds: 
+        SubnetIds: 
             - !Ref Subneta
       Environment:
           Variables:
@@ -277,7 +361,7 @@ Resources:
                     Data="message generated at: " + datetime.now().strftime("%d/%m/%Y, %H:%M:%S"),
                     PartitionKey=str(uuid.uuid1())
                 )
- 
+
 
   ScheduledRule: 
     Type: AWS::Events::Rule

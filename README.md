@@ -1,10 +1,12 @@
 ## serverless-datapipeline-in-privatesubnet
 
-This is working example is used to demostrate to enterprise customer who has very strict cyber security control requirement in place, and they requires lambda to run inside VPC without internet access but also need to access other serverless service like DynamoDB and Kinesis via private endpoint.
+This is working example is used to demostrate to enterprise customer who has very strict cyber security control requirement in place, and they requires lambda to run inside VPC without internet access but also need to access other serverless service like DynamoDB and Kinesis as well as KMS via private endpoint.
 
 By deploying the single cloudformation file, you will get a working example data pipeline to demostrate, 
 
 publisher lambda --> kinesis --> consumer lambda --> dynamodb
+
+Publisher lambda will also access KMS service via kms endpoint to encrypt the payload; consumer lambda being triggerred by Kinesis message and will access the kms endpoint to decrypt the payload as well.
 
 ![serverless-privatevpc-datapipeline-demo](images/Archi.png)
 
